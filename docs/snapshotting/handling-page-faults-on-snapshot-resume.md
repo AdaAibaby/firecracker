@@ -119,7 +119,10 @@ details on balloon, please refer to [this doc](../ballooning.md).
 When the balloon device asks for removal of a memory range, Firecracker calls
 `madvise` with the `MADV_DONTNEED` flag in order to let the kernel know that it
 can free up memory found in that specific area. On such a system call, the
-userfaultfd interface sends `UFFD_EVENT_REMOVE`.
+userfaultfd interface sends `UFFD_EVENT_REMOVE`. For hugetlbfs-backed memory,
+only the whole huge pages inside the range are `madvise`d. Firecracker zeroes
+any partial huge page at either end by writing to it, which raises a page fault
+rather than `UFFD_EVENT_REMOVE` if the page is not populated yet.
 
 When implementing the logic for the page fault handler, users must identify
 events of type `UFFD_EVENT_REMOVE` and handle them by zeroing out those pages.

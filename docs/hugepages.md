@@ -81,7 +81,8 @@ the host uses huge mappings.
 The traditional balloon device reports free pages at 4k granularity, this means
 the device is unable to reclaim the hugepage backing of the guest and drop RSS.
 However, the balloon can still be inflated and used to restrict memory usage in
-the guest.
+the guest. Firecracker zeroes the inflated pages instead, which allocates the
+huge pages holding them if they were not backed yet.
 
 [hugetlbfs_docs]: https://docs.kernel.org/admin-guide/mm/hugetlbpage.html
 [thp_docs]: https://www.kernel.org/doc/html/next/admin-guide/mm/transhuge.html#hugepages-in-tmpfs-shmem
