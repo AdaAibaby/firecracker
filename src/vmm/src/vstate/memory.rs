@@ -915,7 +915,6 @@ impl GuestRegionMmapExt {
                         );
                     }
                 }
-                Ok(())
             }
             // Match either the case of an anonymous mapping, or the case
             // of a shared file mapping.
@@ -931,12 +930,13 @@ impl GuestRegionMmapExt {
                 if ret < 0 {
                     let os_error = std::io::Error::last_os_error();
                     error!("discard_range: madvise failed: {:?}", os_error);
-                    Err(GuestMemoryError::IOError(os_error))
-                } else {
-                    Ok(())
+                    return Err(GuestMemoryError::IOError(os_error));
                 }
             }
         }
+        self.bitmap()
+            .mark_dirty(u64_to_usize(caddr.raw_value()), len);
+        Ok(())
     }
 }
 
@@ -2224,6 +2224,42 @@ mod tests {
                 .unwrap_err(),
             GuestMemoryError::InvalidGuestAddress(_)
         );
+    }
+
+    #[test]
+    fn test_discard_range_marks_dirty() {
+        let page_size = host_page_size();
+        let guest_memory = into_region_ext(
+            anonymous(
+                &[(GuestAddress(0), 2 * page_size)],
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        let ones = vec![1u8; 2 * page_size];
+        guest_memory.write(&ones, GuestAddress(0)).unwrap();
+
+        let mut file = TempFile::new().unwrap().into_file();
+        guest_memory.dump(&mut file).unwrap();
+        guest_memory.reset_dirty();
+
+        guest_memory
+            .discard_range(GuestAddress(page_size as u64), page_size)
+            .unwrap();
+
+        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
+        kvm_dirty_bitmap.insert(0, vec![0b00]);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        guest_memory
+            .dump_dirty(&mut file, &kvm_dirty_bitmap)
+            .unwrap();
+
+        let mut file_content = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut file_content).unwrap();
+        let expected_file_content = [vec![1u8; page_size], vec![0u8; page_size]].concat();
+        assert_eq!(expected_file_content, file_content);
     }
 
     /// Verifies that `slots_intersecting_range` returns the correct slots for
