@@ -893,6 +893,18 @@ impl GuestRegionMmapExt {
             if edge_len == 0 || self.check_range_plugged(edge_addr, edge_len).is_err() {
                 continue;
             }
+            // A partial huge page is zeroed in place rather than freed. Writing to it faults in its
+            // backing huge page; on an exhausted huge page pool that allocation fails with -ENOSPC
+            // and hugetlb_no_page returns VM_FAULT_SIGBUS (via vmf_error), killing Firecracker.
+            // Discarding the aligned range above also drops the huge page's reservation (hugetlbfs
+            // hole-punch -> region_del), so a previously reserved edge is no longer guaranteed a
+            // page. Only zero an edge whose backing huge page is already resident; an unbacked edge
+            // reads as zero on fault, so skipping it is equivalent and cannot fault a fresh huge
+            // page in. Anonymous and non-hugetlb regions have no partial pages, so this only ever
+            // runs for hugetlb.
+            if backing_page_size != page_size && !self.range_resident(edge_addr, edge_len)? {
+                continue;
+            }
             assert!(edge_len.is_multiple_of(ZEROS.len()));
             for offset in (edge_start..edge_end).step_by(ZEROS.len()) {
                 self.write_slice(&ZEROS, MemoryRegionAddress(offset))?;
@@ -900,6 +912,31 @@ impl GuestRegionMmapExt {
         }
         self.bitmap().mark_dirty(u64_to_usize(start), len);
         Ok(())
+    }
+
+    /// Returns whether every host page in the range is resident, i.e. backed by a physical page.
+    /// A hugetlb range reports resident only when its backing huge page is faulted in, so a caller
+    /// can use this to avoid a write that would fault in a fresh huge page and risk SIGBUS on an
+    /// exhausted pool.
+    fn range_resident(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+    ) -> Result<bool, GuestMemoryError> {
+        let host_addr = self.get_host_address(caddr)?;
+        let page_count = len.div_ceil(host_page_size());
+        let mut resident = vec![0u8; page_count];
+        // SAFETY: `discard_range` checked that the range is host-page aligned and lies within this
+        // region, and `resident` holds one byte per host page in the range.
+        let ret = unsafe { libc::mincore(host_addr.cast(), len, resident.as_mut_ptr()) };
+        if ret < 0 {
+            let os_error = std::io::Error::last_os_error();
+            error!("discard_range: mincore failed: {:?}", os_error);
+            return Err(GuestMemoryError::IOError(os_error));
+        }
+        // mincore sets bit 0 of each byte when the corresponding page is resident. On a hugetlb
+        // mapping the huge page's present bit is replicated into every host-page slot it covers.
+        Ok(resident.iter().all(|&byte| byte & 1 != 0))
     }
 
     fn remap_anonymous_range(
@@ -2393,6 +2430,46 @@ mod tests {
         ]
         .concat();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_discard_range_on_hugetlb_skips_unbacked_partial_page() {
+        if free_hugepages_2m() < 1 {
+            println!("Skipping: no free 2 MiB hugepage available");
+            return;
+        }
+        let page_size = HugePageConfig::Hugetlbfs2M.page_size();
+        // A single huge page that is never written, so its backing huge page is not faulted in.
+        let mem = into_region_ext(
+            anonymous(
+                &[(GuestAddress(0), page_size)],
+                false,
+                HugePageConfig::Hugetlbfs2M,
+            )
+            .unwrap(),
+        );
+        let region = mem.iter().next().unwrap();
+        let edge = MemoryRegionAddress(host_page_size() as u64);
+        let edge_len = page_size - host_page_size();
+
+        // The huge page is unbacked before the discard.
+        assert!(!region.range_resident(edge, edge_len).unwrap());
+
+        // Discarding [host_page_size, page_size) leaves an empty backing-aligned middle and a
+        // single partial edge inside the unbacked huge page. The edge must be skipped rather than
+        // zeroed: zeroing it would fault in a fresh huge page (and SIGBUS on an exhausted pool).
+        region
+            .discard_range(edge, edge_len)
+            .unwrap();
+
+        // The edge is still unbacked: the discard did not write to it, so no huge page was
+        // allocated. Without the guard, the zeroing write would have faulted one in here.
+        assert!(!region.range_resident(edge, edge_len).unwrap());
+
+        // The unbacked range still reads back as zero.
+        let mut actual = vec![1; edge_len];
+        region.read_slice(&mut actual, edge).unwrap();
+        assert_eq!(actual, vec![0; edge_len]);
     }
 
     #[test]
