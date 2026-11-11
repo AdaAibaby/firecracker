@@ -295,6 +295,8 @@ pub fn prepare_vm(
             regions.iter().copied(),
             vm_resources.machine_config.huge_pages,
             memfd_backing.as_ref().map(|backing| &*backing.file),
+            // Boot path always serves MISSING faults; minor sharing is a restore-only PoC.
+            persist::UffdRegistrationMode::Missing,
         )
         .map_err(StartMicrovmError::MemBackend)?;
         (Some(uffd), share_memfd)
@@ -397,6 +399,7 @@ pub fn build_microvm_for_boot(
         let mappings = persist::uffd_mappings(
             vm.guest_memory().iter().map(|region| &region.inner),
             vm_resources.machine_config.huge_pages,
+            persist::UffdRegistrationMode::Missing,
         );
         persist::send_uffd_handshake(
             &mem_backend.backend_path,

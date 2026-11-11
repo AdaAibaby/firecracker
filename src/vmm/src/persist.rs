@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vm_memory::GuestMemoryBackend;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -136,6 +136,28 @@ pub struct GuestRegionUffdMapping {
     /// to be removed in 2.0.
     #[deprecated]
     pub page_size_kib: usize,
+    /// How Firecracker registered this region with the userfaultfd, so the handler knows whether
+    /// to resolve a fault with `UFFDIO_COPY` (missing) or `UFFDIO_CONTINUE` (minor). Defaults to
+    /// `Missing`, so a handler built for the plain protocol and an old Firecracker both keep the
+    /// current behaviour.
+    #[serde(default)]
+    pub registration_mode: UffdRegistrationMode,
+}
+
+/// The UFFD registration mode of a guest memory region, carried in the handshake so the external
+/// handler resolves faults the matching way.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UffdRegistrationMode {
+    /// `UFFDIO_REGISTER_MODE_MISSING`; faults are resolved with `UFFDIO_COPY`. Today's behaviour.
+    #[default]
+    Missing,
+    /// `UFFDIO_REGISTER_MODE_MINOR`; the region is backed by a shared mapping whose page-cache
+    /// page already holds the content, so a fault is resolved with `UFFDIO_CONTINUE` (no memcpy).
+    Minor,
+    /// `UFFDIO_REGISTER_MODE_MINOR | UFFDIO_REGISTER_MODE_WP`; as `Minor`, and a guest write takes
+    /// a write-protect fault so the handler can diverge the page per-VM (copy-on-write).
+    MinorWp,
 }
 
 /// Errors related to saving and restoring Microvm state.
@@ -589,14 +611,33 @@ pub fn restore_from_snapshot(
                         None,
                     )
                 }
-                MemBackendType::Uffd | MemBackendType::SharedMemfd => guest_memory_from_uffd(
-                    &mem_backend.backend_path,
-                    mem_state,
-                    track_dirty_pages,
-                    huge_pages,
-                    mem_backend.backend_type == MemBackendType::SharedMemfd,
-                )
-                .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+                MemBackendType::Uffd | MemBackendType::SharedMemfd => {
+                    let backing = match (&mem_backend.shared_backing_path, mem_backend.backend_type)
+                    {
+                        // PoC opt-in: a caller-provided shared read-only backing takes precedence,
+                        // on the plain `Uffd` backend, and switches the region to minor-fault mode.
+                        (Some(path), MemBackendType::Uffd) => {
+                            let file = std::fs::OpenOptions::new()
+                                .read(true)
+                                .open(path)
+                                .map_err(GuestMemoryFromUffdError::SharedBackingOpen)?;
+                            UffdBacking::SharedMinor {
+                                backing: Arc::new(file),
+                                wp: mem_backend.shared_backing_wp,
+                            }
+                        }
+                        (_, MemBackendType::SharedMemfd) => UffdBacking::Memfd,
+                        _ => UffdBacking::PrivateMissing,
+                    };
+                    guest_memory_from_uffd(
+                        &mem_backend.backend_path,
+                        mem_state,
+                        track_dirty_pages,
+                        huge_pages,
+                        backing,
+                    )
+                    .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
+                }
             };
             builder::prepare_vm_from_snapshot(
                 &microvm_state,
@@ -748,6 +789,20 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
+    /// Failed to open the shared backing file: {0}
+    SharedBackingOpen(std::io::Error),
+}
+
+/// How the UFFD restore path backs and registers guest memory.
+enum UffdBacking {
+    /// Today: private anonymous, registered MISSING, served by `UFFDIO_COPY`.
+    PrivateMissing,
+    /// `SharedMemfd`: a Firecracker-allocated memfd handed to the backend; registered MISSING,
+    /// served by `UFFDIO_COPY`.
+    Memfd,
+    /// PoC: a caller-provided read-only backing shared across VMMs from the *same* snapshot, mapped
+    /// `MAP_SHARED` and registered MINOR[|WP], served by `UFFDIO_CONTINUE`.
+    SharedMinor { backing: Arc<File>, wp: bool },
 }
 
 fn guest_memory_from_uffd(
@@ -755,29 +810,46 @@ fn guest_memory_from_uffd(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
-    share_memfd: bool,
+    backing: UffdBacking,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
     let regions = mem_state.regions();
-    let (guest_memory, memfd) = if share_memfd {
-        // One memfd exactly the size of the snapshot's memory, laid out like the memory file.
-        let total_size = regions
-            .iter()
-            .try_fold(0u64, |acc, &(_, size)| acc.checked_add(size as u64))
-            .ok_or(MemoryError::OffsetTooLarge)?;
-        let mut backing = MemfdBacking::new(total_size, huge_pages)?;
-        let guest_memory = backing.allocate(&regions, track_dirty_pages, huge_pages)?;
-        (guest_memory, Some(backing.file))
-    } else {
-        (
+    let (guest_memory, memfd, registration_mode) = match backing {
+        UffdBacking::Memfd => {
+            // One memfd exactly the size of the snapshot's memory, laid out like the memory file.
+            let total_size = regions
+                .iter()
+                .try_fold(0u64, |acc, &(_, size)| acc.checked_add(size as u64))
+                .ok_or(MemoryError::OffsetTooLarge)?;
+            let mut backing = MemfdBacking::new(total_size, huge_pages)?;
+            let guest_memory = backing.allocate(&regions, track_dirty_pages, huge_pages)?;
+            (
+                guest_memory,
+                Some(backing.file),
+                UffdRegistrationMode::Missing,
+            )
+        }
+        UffdBacking::SharedMinor { backing, wp } => {
+            let guest_memory =
+                memory::shared_file_backed(&regions, backing, track_dirty_pages, huge_pages)?;
+            let mode = if wp {
+                UffdRegistrationMode::MinorWp
+            } else {
+                UffdRegistrationMode::Minor
+            };
+            (guest_memory, None, mode)
+        }
+        UffdBacking::PrivateMissing => (
             memory::anonymous(&regions, track_dirty_pages, huge_pages)?,
             None,
-        )
+            UffdRegistrationMode::Missing,
+        ),
     };
     let uffd = uffd_for_guest_memory(
         mem_uds_path,
         guest_memory.iter(),
         huge_pages,
         memfd.as_deref(),
+        registration_mode,
     )?;
     Ok((guest_memory, Some(uffd)))
 }
@@ -789,8 +861,9 @@ pub fn uffd_for_guest_memory<'a>(
     regions: impl Iterator<Item = &'a GuestRegionMmap> + Clone,
     huge_pages: HugePageConfig,
     memfd: Option<&File>,
+    registration_mode: UffdRegistrationMode,
 ) -> Result<Uffd, GuestMemoryFromUffdError> {
-    let backend_mappings = uffd_mappings(regions.clone(), huge_pages);
+    let backend_mappings = uffd_mappings(regions.clone(), huge_pages, registration_mode);
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -800,6 +873,24 @@ pub fn uffd_for_guest_memory<'a>(
     // we never call madvise anyway, so no need to put this into a conditional.
     uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
 
+    // PoC: minor-fault sharing. Ask the kernel for the minor feature matching the backing type, so
+    // the shared read-only mapping can be served with UFFDIO_CONTINUE. On a kernel without it,
+    // `create()` fails and the caller should fall back to the MISSING + anonymous path.
+    if matches!(
+        registration_mode,
+        UffdRegistrationMode::Minor | UffdRegistrationMode::MinorWp
+    ) {
+        // TODO(poc): the pinned `userfaultfd = "0.9.0"` does not expose these; bump the crate (or
+        // add the bits via `userfaultfd-sys`) so `FeatureFlags::MINOR_SHMEM`/`MINOR_HUGETLBFS` and
+        // `RegisterMode::MINOR`/`WRITE_PROTECT` below resolve. Confirm on a networked Linux host.
+        let minor_feature = if huge_pages.is_hugetlbfs() {
+            FeatureFlags::MINOR_HUGETLBFS
+        } else {
+            FeatureFlags::MINOR_SHMEM
+        };
+        uffd_builder.require_features(FeatureFlags::EVENT_REMOVE | minor_feature);
+    }
+
     let uffd = uffd_builder
         .close_on_exec(true)
         .non_blocking(true)
@@ -807,9 +898,19 @@ pub fn uffd_for_guest_memory<'a>(
         .create()
         .map_err(GuestMemoryFromUffdError::Create)?;
 
+    let register_mode = match registration_mode {
+        UffdRegistrationMode::Missing => RegisterMode::MISSING,
+        UffdRegistrationMode::Minor => RegisterMode::MINOR,
+        UffdRegistrationMode::MinorWp => RegisterMode::MINOR | RegisterMode::WRITE_PROTECT,
+    };
+
     for mem_region in regions {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            register_mode,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
     // The uffd always comes first, so that a handler written for the plain UFFD protocol (which
@@ -829,6 +930,7 @@ pub fn uffd_for_guest_memory<'a>(
 pub fn uffd_mappings<'a>(
     regions: impl Iterator<Item = &'a GuestRegionMmap>,
     huge_pages: HugePageConfig,
+    registration_mode: UffdRegistrationMode,
 ) -> Vec<GuestRegionUffdMapping> {
     let mut backend_mappings = Vec::new();
     let mut offset = 0;
@@ -840,6 +942,7 @@ pub fn uffd_mappings<'a>(
             offset,
             page_size: huge_pages.page_size(),
             page_size_kib: huge_pages.page_size(),
+            registration_mode,
         });
         offset += mem_region.size() as u64;
     }
@@ -1099,12 +1202,20 @@ mod tests {
 
         let guest_memory =
             memory::anonymous(&mem_state.regions(), false, HugePageConfig::None).unwrap();
-        let uffd_regions = uffd_mappings(guest_memory.iter(), HugePageConfig::None);
+        let uffd_regions = uffd_mappings(
+            guest_memory.iter(),
+            HugePageConfig::None,
+            UffdRegistrationMode::Missing,
+        );
 
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);
         assert_eq!(uffd_regions[0].offset, 0);
         assert_eq!(uffd_regions[0].page_size, HugePageConfig::None.page_size());
+        assert_eq!(
+            uffd_regions[0].registration_mode,
+            UffdRegistrationMode::Missing
+        );
     }
 
     #[test]
@@ -1117,6 +1228,7 @@ mod tests {
                 offset: 0,
                 page_size: HugePageConfig::None.page_size(),
                 page_size_kib: HugePageConfig::None.page_size(),
+                registration_mode: UffdRegistrationMode::Missing,
             },
             GuestRegionUffdMapping {
                 base_host_virt_addr: 0x100000,
@@ -1124,6 +1236,7 @@ mod tests {
                 offset: 0,
                 page_size: HugePageConfig::Hugetlbfs2M.page_size(),
                 page_size_kib: HugePageConfig::Hugetlbfs2M.page_size(),
+                registration_mode: UffdRegistrationMode::Minor,
             },
         ];
 

@@ -1370,6 +1370,35 @@ pub fn anonymous(
     )
 }
 
+/// PoC: maps `regions` `MAP_SHARED` from a caller-provided `backing`, laid out like a guest memory
+/// snapshot file (region *n* at its snapshot `offset`). N VMMs mapping the **same inode** this way
+/// share one page-cache copy, so a UFFD registered `MODE_MINOR` on these regions can resolve a
+/// fault with `UFFDIO_CONTINUE` against that single shared copy — untouched pages stay shared
+/// copy-on-write across all microVMs resumed from the same snapshot.
+///
+/// The backing is the snapshot's guest-memory contents (e.g. the memory file on shared storage, or
+/// a preloaded memfd). It must be at least as large as the sum of the regions.
+///
+/// Note on the write path: divergence on a guest write is the backend's responsibility (register
+/// `MODE_MINOR | MODE_WP` and privatise the page on the WP fault). This helper only establishes the
+/// shared mapping and does not by itself prevent a write from reaching the shared backing; a
+/// production design must resolve the WP fault into a per-VM private page. See the discussion in
+/// `docs/snapshotting/shared-memfd.md` and firecracker#6269.
+pub fn shared_file_backed(
+    regions: &[(GuestAddress, usize)],
+    backing: Arc<File>,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    memory_regions_from_ranges_file_backed(
+        regions,
+        libc::MAP_SHARED | huge_pages.mmap_flags(),
+        FileOffset::from_arc(backing, 0),
+        track_dirty_pages,
+        huge_pages.madvise_flags(),
+    )
+}
+
 /// A single memfd backing all guest memory regions, laid out like a guest memory snapshot file.
 ///
 /// Regions are allocated in order with [`MemfdBacking::allocate`]. The memfd is sized up front
