@@ -57,6 +57,12 @@ pub const VENDOR_ID_INTEL: &[u8; 12] = b"GenuineIntel";
 /// AMD brand string.
 pub const VENDOR_ID_AMD: &[u8; 12] = b"AuthenticAMD";
 
+/// Hygon brand string. Hygon Dhyana is a licensed AMD Zen design; Linux and KVM
+/// route it through their AMD implementation. Only recognised under the `hygon`
+/// feature, where it maps onto the AMD CPUID paths.
+#[cfg(feature = "hygon")]
+pub const VENDOR_ID_HYGON: &[u8; 12] = b"HygonGenuine";
+
 /// Intel brand string.
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub const VENDOR_ID_INTEL_STR: &str = unsafe { std::str::from_utf8_unchecked(VENDOR_ID_INTEL) };
@@ -64,6 +70,11 @@ pub const VENDOR_ID_INTEL_STR: &str = unsafe { std::str::from_utf8_unchecked(VEN
 /// AMD brand string.
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub const VENDOR_ID_AMD_STR: &str = unsafe { std::str::from_utf8_unchecked(VENDOR_ID_AMD) };
+
+/// Hygon brand string, as `str`. See [`VENDOR_ID_HYGON`].
+#[cfg(feature = "hygon")]
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub const VENDOR_ID_HYGON_STR: &str = unsafe { std::str::from_utf8_unchecked(VENDOR_ID_HYGON) };
 
 /// To store the brand string we have 3 leaves, each with 4 registers, each with 4 bytes.
 pub const BRAND_STRING_LENGTH: usize = 3 * 4 * 4;
@@ -408,6 +419,11 @@ impl TryFrom<kvm_bindings::CpuId> for Cpuid {
         match std::str::from_utf8(&vendor_id) {
             Ok(VENDOR_ID_INTEL_STR) => Ok(Cpuid::Intel(IntelCpuid::from(kvm_cpuid))),
             Ok(VENDOR_ID_AMD_STR) => Ok(Cpuid::Amd(AmdCpuid::from(kvm_cpuid))),
+            // Hygon Dhyana reports `HygonGenuine` and is a licensed AMD Zen design; treat it as
+            // AMD so its CPUID is normalised through the AMD path, matching Linux/KVM. Gated on
+            // the `hygon` feature so a default build keeps the strict Intel/AMD-only behaviour.
+            #[cfg(feature = "hygon")]
+            Ok(VENDOR_ID_HYGON_STR) => Ok(Cpuid::Amd(AmdCpuid::from(kvm_cpuid))),
             _ => Err(CpuidTryFromKvmCpuid::UnsupportedVendor(vendor_id)),
         }
     }
@@ -785,4 +801,54 @@ mod tests {
         let cpuid = Cpuid::try_from(kvm_cpuid);
         assert_eq!(cpuid, Err(CpuidTryFromKvmCpuid::UnsupportedVendor([0; 12])));
     }
+
+    // Without the `hygon` feature, a HygonGenuine leaf 0 is an unsupported vendor and the
+    // conversion must fail exactly as any other non-Intel/AMD vendor — i.e. a default build
+    // keeps the strict Intel/AMD-only behaviour.
+    #[cfg(not(feature = "hygon"))]
+    #[test]
+    fn test_hygon_kvmcpuid_rejected_without_feature() {
+        // HygonGenuine in EBX,EDX,ECX order.
+        let leaf0 = kvm_bindings::kvm_cpuid_entry2 {
+            function: 0x0,
+            index: 0x0,
+            flags: 0x0,
+            eax: 0x1,
+            ebx: 0x6F67_7948, // "Hygo"
+            edx: 0x6E65_476E, // "nGen"
+            ecx: 0x656E_6975, // "uine"
+            ..Default::default()
+        };
+        let kvm_cpuid = kvm_bindings::CpuId::from_entries(&[leaf0]).unwrap();
+        assert_eq!(
+            Cpuid::try_from(kvm_cpuid),
+            Err(CpuidTryFromKvmCpuid::UnsupportedVendor(*VENDOR_ID_HYGON_BYTES))
+        );
+    }
+
+    // With the `hygon` feature, HygonGenuine maps to the AMD CPUID variant, mirroring how
+    // Linux/KVM route Hygon Dhyana (a licensed Zen design) through their AMD implementation.
+    #[cfg(feature = "hygon")]
+    #[test]
+    fn test_hygon_kvmcpuid_maps_to_amd() {
+        let leaf0 = kvm_bindings::kvm_cpuid_entry2 {
+            function: 0x0,
+            index: 0x0,
+            flags: 0x0,
+            eax: 0x1,
+            ebx: 0x6F67_7948, // "Hygo"
+            edx: 0x6E65_476E, // "nGen"
+            ecx: 0x656E_6975, // "uine"
+            ..Default::default()
+        };
+        let kvm_cpuid =
+            kvm_bindings::CpuId::from_entries(&[leaf0, build_sample_leaf_for_kvmcpuid()]).unwrap();
+        let cpuid = Cpuid::try_from(kvm_cpuid).unwrap();
+        assert!(matches!(cpuid, Cpuid::Amd(_)));
+    }
+
+    // Reference copy of the HygonGenuine bytes for the rejection test above (the
+    // `VENDOR_ID_HYGON` const itself only exists under the `hygon` feature).
+    #[cfg(not(feature = "hygon"))]
+    const VENDOR_ID_HYGON_BYTES: &[u8; 12] = b"HygonGenuine";
 }

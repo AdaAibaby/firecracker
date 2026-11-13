@@ -10,6 +10,15 @@ and this project adheres to
 
 ### Added
 
+- Added an off-by-default `hygon` cargo feature that accepts the `HygonGenuine`
+  CPUID vendor string through the existing AMD CPUID paths (Hygon Dhyana is a
+  licensed AMD Zen design that Linux/KVM already route through their AMD
+  implementation), so a microVM can start on a Hygon host. It is a
+  community-supported, best-effort component: off in every default/released
+  build (default artifacts byte-for-byte unchanged), owned via `CODEOWNERS`, and
+  validated on contributor-provided hardware by `.buildkite/pipeline_hygon.py`.
+  Static CPU templates stay strict — `T2A` is still rejected on Hygon by
+  default. See [docs/cpu_templates/hygon-support.md](docs/cpu_templates/hygon-support.md).
 - [#6226](https://github.com/firecracker-microvm/firecracker/pull/6226),
   [#6227](https://github.com/firecracker-microvm/firecracker/pull/6227),
   [#6228](https://github.com/firecracker-microvm/firecracker/pull/6228),

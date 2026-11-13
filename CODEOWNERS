@@ -1,0 +1,16 @@
+# Code ownership for Firecracker.
+#
+# This file assigns reviewers to paths. It is advisory for the core tree, but it
+# is the mechanism by which the "community-supported, best-effort" tier (see
+# MAINTAINERS.md) gets named owners who triage and fix their component.
+#
+# NOTE: the entries below are placeholders to be filled with the GitHub handles
+# of the contributors who commit to owning the component. An owner-less
+# best-effort component does not meet the tier's requirements.
+
+# --- Hygon (HygonGenuine) x86_64 support via the AMD paths, feature `hygon` ---
+# Owned by the contributors who provide the Hygon CI hardware and commit to
+# triaging/fixing Hygon-only regressions. The mapping itself is a handful of
+# feature-gated lines in the AMD CPUID path.
+docs/cpu_templates/hygon-support.md                       @hygon-owner-placeholder
+.buildkite/pipeline_hygon.py                              @hygon-owner-placeholder

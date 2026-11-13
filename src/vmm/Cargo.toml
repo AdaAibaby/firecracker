@@ -13,6 +13,12 @@ default = []
 tracing = ["log-instrument"]
 gdb = ["arrayvec", "gdbstub", "gdbstub_arch"]
 fuzzing = []
+# Community-supported, best-effort. Accepts the HygonGenuine CPUID vendor string
+# through the existing AMD code paths (Hygon Dhyana is a licensed Zen design that
+# Linux/KVM already route through their AMD implementation). Off by default, so a
+# default build is byte-for-byte unchanged and the AMD/Intel paths carry no extra
+# runtime branch. See docs/cpu_templates/hygon-support.md.
+hygon = []
 
 [dependencies]
 

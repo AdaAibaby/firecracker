@@ -123,9 +123,22 @@ impl super::AmdCpuid {
     /// specification it is possible to enter an indefinite loop. To avoid this, this will return an
     /// error when the host CPUID vendor id does not match the AMD CPUID vendor id.
     fn passthrough_cache_topology(&mut self) -> Result<(), PassthroughCacheTopologyError> {
-        if get_vendor_id_from_host().map_err(PassthroughCacheTopologyError::NoVendorId)?
-            != *VENDOR_ID_AMD
-        {
+        let host_vendor =
+            get_vendor_id_from_host().map_err(PassthroughCacheTopologyError::NoVendorId)?;
+        // AMD, and (under the `hygon` feature) Hygon, share the same cache-topology leaf
+        // layout (0x8000001d/0x8000001e), so the passthrough is valid for both. Any other
+        // vendor is rejected to avoid the indefinite loop the AMD spec warns about.
+        let compatible = host_vendor == *VENDOR_ID_AMD || {
+            #[cfg(feature = "hygon")]
+            {
+                host_vendor == *crate::cpu_config::x86_64::cpuid::VENDOR_ID_HYGON
+            }
+            #[cfg(not(feature = "hygon"))]
+            {
+                false
+            }
+        };
+        if !compatible {
             return Err(PassthroughCacheTopologyError::BadVendorId);
         }
 
